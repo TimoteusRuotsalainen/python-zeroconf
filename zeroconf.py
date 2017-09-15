@@ -569,12 +569,13 @@ class DNSService(DNSRecord):
     """A DNS service record"""
 
     def __init__(self, name, type_, class_, ttl,
-                 priority, weight, port, server):
+                 priority, weight, port, server, interface=None):
         DNSRecord.__init__(self, name, type_, class_, ttl)
         self.priority = priority
         self.weight = weight
         self.port = port
         self.server = server
+        self.interface = interface
 
     def write(self, out):
         """Used in constructing an outgoing packet"""
@@ -584,12 +585,13 @@ class DNSService(DNSRecord):
         out.write_name(self.server)
 
     def __eq__(self, other):
-        """Tests equality on priority, weight, port and server"""
+        """Tests equality on priority, weight, port, server and interface"""
         return (isinstance(other, DNSService) and
                 self.priority == other.priority and
                 self.weight == other.weight and
                 self.port == other.port and
-                self.server == other.server)
+                self.server == other.server and
+                self.interface == other.interface)
 
     def __repr__(self):
         """String representation"""
@@ -600,7 +602,7 @@ class DNSIncoming(QuietLogger):
 
     """Object representation of an incoming DNS packet"""
 
-    def __init__(self, data):
+    def __init__(self, data, interface):
         """Constructor from string holding bytes of packet"""
         self.offset = 0
         self.data = data
@@ -613,6 +615,7 @@ class DNSIncoming(QuietLogger):
         self.num_authorities = 0
         self.num_additionals = 0
         self.valid = False
+        self.interface = interface
 
         try:
             self.read_header()
@@ -687,7 +690,7 @@ class DNSIncoming(QuietLogger):
                 rec = DNSService(
                     domain, type_, class_, ttl,
                     self.read_unsigned_short(), self.read_unsigned_short(),
-                    self.read_unsigned_short(), self.read_name())
+                    self.read_unsigned_short(), self.read_name(), self.interface)
             elif type_ == _TYPE_HINFO:
                 rec = DNSHinfo(
                     domain, type_, class_, ttl,
@@ -1142,11 +1145,11 @@ class Listener(QuietLogger):
         except Exception:
             self.log_exception_warning()
             return
-
-        log.debug('Received from %r:%r: %r ', addr, port, data)
+        interface = socket_.getsockname()[0]
+        log.debug('Received on interface %r from %r:%r: %r ', interface, addr, port, data)
 
         self.data = data
-        msg = DNSIncoming(data)
+        msg = DNSIncoming(data, interface)
         if not msg.valid:
             pass
 
@@ -1162,7 +1165,7 @@ class Listener(QuietLogger):
                 self.zc.handle_query(msg, _MDNS_ADDR, _MDNS_PORT)
 
         else:
-            self.zc.handle_response(msg)
+            self.zc.handle_response(msg, interface)
 
 
 class Reaper(threading.Thread):
@@ -1182,10 +1185,11 @@ class Reaper(threading.Thread):
             if self.zc.done:
                 return
             now = current_time_millis()
-            for record in self.zc.cache.entries():
-                if record.is_expired(now):
-                    self.zc.update_record(now, record)
-                    self.zc.cache.remove(record)
+            for interface in self.zc._listen_sockets:
+                for record in self.zc.caches[interface.getsockname()[0]].entries():
+                    if record.is_expired(now):
+                        self.zc.update_record(now, record)
+                        self.zc.caches[interface.getsockname()[0]].remove(record)
 
 
 class Signal(object):
@@ -1309,7 +1313,8 @@ class ServiceBrowser(threading.Thread):
         self.join()
 
     def run(self):
-        self.zc.add_listener(self, DNSQuestion(self.type, _TYPE_PTR, _CLASS_IN))
+        for interface in self.zc._listen_sockets:
+            self.zc.add_listener(self, DNSQuestion(self.type, _TYPE_PTR, _CLASS_IN), interface.getsockname()[0])
 
         while True:
             now = current_time_millis()
@@ -1324,8 +1329,8 @@ class ServiceBrowser(threading.Thread):
                 for record in self.services.values():
                     if not record.is_expired(now):
                         out.add_answer_at_time(record, now)
-
-                self.zc.send(out)
+                for interface in self.zc._listen_sockets:
+                    self.zc.send(out, interface)
                 self.next_time = now + self.delay
                 self.delay = min(20 * 1000, self.delay * 2)
 
@@ -1338,7 +1343,7 @@ class ServiceInfo(object):
 
     """Service information"""
 
-    def __init__(self, type_, name, address=None, port=None, weight=0,
+    def __init__(self, type_, name, interface, address=None, port=None, weight=0,
                  priority=0, properties=None, server=None):
         """Create a service description.
 
@@ -1350,7 +1355,8 @@ class ServiceInfo(object):
         priority: priority of the service
         properties: dictionary of properties (or a string holding the
                     bytes for the text field)
-        server: fully qualified name for service host (defaults to name)"""
+        server: fully qualified name for service host (defaults to name)
+        interface: IP address of interface the service was discovered on"""
 
         if not type_.endswith(service_type_name(name)):
             raise BadTypeInNameException
@@ -1364,6 +1370,7 @@ class ServiceInfo(object):
             self.server = server
         else:
             self.server = name
+        self.interface = interface
         self._properties = {}
         self._set_properties(properties)
 
@@ -1453,9 +1460,10 @@ class ServiceInfo(object):
                     self.port = record.port
                     self.weight = record.weight
                     self.priority = record.priority
+                    #self.interface = record.interface
                     # self.address = None
                     self.update_record(
-                        zc, now, zc.cache.get_by_details(
+                        zc, now, zc.caches[self.interface.getsockname()[0]].get_by_details(
                             self.server, _TYPE_A, _CLASS_IN))
             elif record.type == _TYPE_TXT:
                 if record.name == self.name:
@@ -1469,6 +1477,7 @@ class ServiceInfo(object):
         delay = _LISTENER_TIME
         next_ = now + delay
         last = now + timeout
+        interface_addr = self.interface.getsockname()[0]
 
         record_types_for_check_cache = [
             (_TYPE_SRV, _CLASS_IN),
@@ -1477,7 +1486,7 @@ class ServiceInfo(object):
         if self.server is not None:
             record_types_for_check_cache.append((_TYPE_A, _CLASS_IN))
         for record_type in record_types_for_check_cache:
-            cached = zc.cache.get_by_details(self.name, *record_type)
+            cached = zc.caches[interface_addr].get_by_details(self.name, *record_type)
             if cached:
                 self.update_record(zc, now, cached)
 
@@ -1485,7 +1494,7 @@ class ServiceInfo(object):
             return True
 
         try:
-            zc.add_listener(self, DNSQuestion(self.name, _TYPE_ANY, _CLASS_IN))
+            zc.add_listener(self, DNSQuestion(self.name, _TYPE_ANY, _CLASS_IN), interface_addr)
             while None in (self.server, self.address, self.text):
                 if last <= now:
                     return False
@@ -1494,22 +1503,22 @@ class ServiceInfo(object):
                     out.add_question(
                         DNSQuestion(self.name, _TYPE_SRV, _CLASS_IN))
                     out.add_answer_at_time(
-                        zc.cache.get_by_details(
+                        zc.caches[interface_addr].get_by_details(
                             self.name, _TYPE_SRV, _CLASS_IN), now)
 
                     out.add_question(
                         DNSQuestion(self.name, _TYPE_TXT, _CLASS_IN))
                     out.add_answer_at_time(
-                        zc.cache.get_by_details(
+                        zc.caches[interface_addr].get_by_details(
                             self.name, _TYPE_TXT, _CLASS_IN), now)
 
                     if self.server is not None:
                         out.add_question(
                             DNSQuestion(self.server, _TYPE_A, _CLASS_IN))
                         out.add_answer_at_time(
-                            zc.cache.get_by_details(
+                            zc.caches[interface_addr].get_by_details(
                                 self.server, _TYPE_A, _CLASS_IN), now)
-                    zc.send(out)
+                    zc.send(out, self.interface)
                     next_ = now + delay
                     delay *= 2
 
@@ -1599,7 +1608,7 @@ def normalize_interface_choice(choice, address_family):
     return choice
 
 
-def new_socket():
+def new_socket(interface=''):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -1629,7 +1638,7 @@ def new_socket():
     loop = struct.pack(b'B', 1)
     s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, loop)
 
-    s.bind(('', _MDNS_PORT))
+    s.bind((interface, _MDNS_PORT))
     return s
 
 
@@ -1657,7 +1666,7 @@ class Zeroconf(QuietLogger):
         # hook for threads
         self._GLOBAL_DONE = False
 
-        self._listen_socket = new_socket()
+        self._listen_sockets = []
         interfaces = normalize_interface_choice(interfaces, socket.AF_INET)
 
         self._respond_sockets = []
@@ -1665,9 +1674,11 @@ class Zeroconf(QuietLogger):
         for i in interfaces:
             log.debug('Adding %r to multicast group', i)
             try:
-                self._listen_socket.setsockopt(
+                listen_socket = new_socket(i)
+                listen_socket.setsockopt(
                     socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
                     socket.inet_aton(_MDNS_ADDR) + socket.inet_aton(i))
+                self._listen_sockets.append(listen_socket)
             except socket.error as e:
                 if get_errno(e) == errno.EADDRINUSE:
                     log.info(
@@ -1694,13 +1705,16 @@ class Zeroconf(QuietLogger):
         self.services = {}
         self.servicetypes = {}
 
-        self.cache = DNSCache()
+        self.caches = {}
+        for i in interfaces:
+            self.caches[i] = DNSCache()
 
         self.condition = threading.Condition()
 
         self.engine = Engine(self)
         self.listener = Listener(self)
-        self.engine.add_reader(self.listener, self._listen_socket)
+        for s in self._listen_sockets:
+            self.engine.add_reader(self.listener, s)
         self.reaper = Reaper(self)
 
         self.debug = None
@@ -1724,9 +1738,17 @@ class Zeroconf(QuietLogger):
         """Returns network's service information for a particular
         name and type, or None if no service matches by the timeout,
         which defaults to 3 seconds."""
-        info = ServiceInfo(type_, name)
-        if info.request(self, timeout):
-            return info
+        services = []
+        for interface in self._listen_sockets:
+
+            info = ServiceInfo(type_, name, interface)
+            if info.request(self, timeout):
+                services.append(info)
+
+        if len(services) > 0:
+            return services
+        else:
+            return None
 
     def add_service_listener(self, type_, listener):
         """Adds a listener for a particular service type.  This object
@@ -1771,7 +1793,7 @@ class Zeroconf(QuietLogger):
             out.add_answer_at_time(
                 DNSService(info.name, _TYPE_SRV, _CLASS_IN,
                            ttl, info.priority, info.weight, info.port,
-                           info.server), 0)
+                           info.server, info.interface), 0)
 
             out.add_answer_at_time(
                 DNSText(info.name, _TYPE_TXT, _CLASS_IN, ttl, info.text), 0)
@@ -1779,7 +1801,8 @@ class Zeroconf(QuietLogger):
                 out.add_answer_at_time(
                     DNSAddress(info.server, _TYPE_A, _CLASS_IN,
                                ttl, info.address), 0)
-            self.send(out)
+            for interface in self._listen_sockets:
+                self.send(out, interface)
             i += 1
             next_time += _REGISTER_TIME
 
@@ -1814,7 +1837,8 @@ class Zeroconf(QuietLogger):
                 out.add_answer_at_time(
                     DNSAddress(info.server, _TYPE_A, _CLASS_IN, 0,
                                info.address), 0)
-            self.send(out)
+            for interface in self._listen_sockets:
+                self.send(out, interface)
             i += 1
             next_time += _UNREGISTER_TIME
 
@@ -1842,7 +1866,8 @@ class Zeroconf(QuietLogger):
                         out.add_answer_at_time(DNSAddress(
                             info.server, _TYPE_A, _CLASS_IN, 0,
                             info.address), 0)
-                self.send(out)
+                for interface in self._listen_sockets:
+                    self.send(out, interface)
                 i += 1
                 next_time += _UNREGISTER_TIME
 
@@ -1864,18 +1889,19 @@ class Zeroconf(QuietLogger):
         i = 0
         while i < 3:
             # check for a name conflict
-            while self.cache.current_entry_with_name_and_alias(
-                    info.type, info.name):
-                if not allow_name_change:
-                    raise NonUniqueNameException
+            for interface in self._listen_sockets:
+                while self.caches[interface.getsockname()[0]].current_entry_with_name_and_alias(
+                        info.type, info.name):
+                    if not allow_name_change:
+                        raise NonUniqueNameException
 
-                # change the name and look for a conflict
-                info.name = '%s-%s.%s' % (
-                    instance_name, next_instance_number, info.type)
-                next_instance_number += 1
-                service_type_name(info.name)
-                next_time = now
-                i = 0
+                    # change the name and look for a conflict
+                    info.name = '%s-%s.%s' % (
+                        instance_name, next_instance_number, info.type)
+                    next_instance_number += 1
+                    service_type_name(info.name)
+                    next_time = now
+                    i = 0
 
             if now < next_time:
                 self.wait(next_time - now)
@@ -1887,18 +1913,19 @@ class Zeroconf(QuietLogger):
             out.add_question(DNSQuestion(info.type, _TYPE_PTR, _CLASS_IN))
             out.add_authorative_answer(DNSPointer(
                 info.type, _TYPE_PTR, _CLASS_IN, _DNS_TTL, info.name))
-            self.send(out)
+            for interface in self._listen_sockets:
+                self.send(out, interface)
             i += 1
             next_time += _CHECK_TIME
 
-    def add_listener(self, listener, question):
+    def add_listener(self, listener, question, interface):
         """Adds a listener for a given question.  The listener will have
         its update_record method called when information is available to
         answer the question."""
         now = current_time_millis()
         self.listeners.append(listener)
         if question is not None:
-            for record in self.cache.entries_with_name(question.name):
+            for record in self.caches[interface].entries_with_name(question.name):
                 if question.answered_by(record) and not record.is_expired(now):
                     listener.update_record(self, now, record)
         self.notify_all()
@@ -1918,21 +1945,21 @@ class Zeroconf(QuietLogger):
             listener.update_record(self, now, rec)
         self.notify_all()
 
-    def handle_response(self, msg):
+    def handle_response(self, msg, interface):
         """Deal with incoming response packets.  All answers
         are held in the cache, and listeners are notified."""
         now = current_time_millis()
         for record in msg.answers:
             expired = record.is_expired(now)
-            if record in self.cache.entries():
+            if record in self.caches[interface].entries():
                 if expired:
-                    self.cache.remove(record)
+                    self.caches[interface].remove(record)
                 else:
-                    entry = self.cache.get(record)
+                    entry = self.caches[interface].get(record)
                     if entry is not None:
                         entry.reset_ttl(record)
             else:
-                self.cache.add(record)
+                self.caches[interface].add(record)
 
         for record in msg.answers:
             self.update_record(now, record)
@@ -2003,7 +2030,7 @@ class Zeroconf(QuietLogger):
             out.id = msg.id
             self.send(out, addr, port)
 
-    def send(self, out, addr=_MDNS_ADDR, port=_MDNS_PORT):
+    def send(self, out, _socket, addr=_MDNS_ADDR, port=_MDNS_PORT):
         """Sends an outgoing packet."""
         packet = out.packet()
         if len(packet) > _MAX_MSG_ABSOLUTE:
@@ -2011,19 +2038,19 @@ class Zeroconf(QuietLogger):
                                   out, len(packet), packet)
             return
         log.debug('Sending %r (%d bytes) as %r...', out, len(packet), packet)
-        for s in self._respond_sockets:
-            if self._GLOBAL_DONE:
-                return
-            try:
-                bytes_sent = s.sendto(packet, 0, (addr, port))
-            except Exception:   # TODO stop catching all Exceptions
-                # on send errors, log the exception and keep going
-                self.log_exception_warning()
-            else:
-                if bytes_sent != len(packet):
-                    self.log_warning_once(
-                        '!!! sent %d out of %d bytes to %r' % (
-                            bytes_sent, len(packet)), s)
+
+        if self._GLOBAL_DONE:
+            return
+        try:
+            bytes_sent = _socket.sendto(packet, 0, (addr, port))
+        except Exception:   # TODO stop catching all Exceptions
+            # on send errors, log the exception and keep going
+            self.log_exception_warning()
+        else:
+            if bytes_sent != len(packet):
+                self.log_warning_once(
+                    '!!! sent %d out of %d bytes to %r' % (
+                        bytes_sent, len(packet)), _socket)
 
     def close(self):
         """Ends the background threads, and prevent this instance from
@@ -2035,8 +2062,9 @@ class Zeroconf(QuietLogger):
             self.unregister_all_services()
 
             # shutdown recv socket and thread
-            self.engine.del_reader(self._listen_socket)
-            self._listen_socket.close()
+            for s in self._listen_sockets:
+                self.engine.del_reader(s)
+                s.close()
             self.engine.join()
 
             # shutdown the rest
